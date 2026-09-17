@@ -1973,6 +1973,36 @@ def limit_tokens_by_record(ledger, cfg, now=None):
             for key, entries in counts.items()}
 
 
+def go_model_allowance(ledger, now=None, end=None, keep=None):
+    """Per-model OpenCode Go value against each model's documented monthly
+    limit, estimated from local history during the current monthly reset
+    window. The quota endpoint reports only aggregate windows, so this is the
+    only per-model view. `scan` persists it to go-allowance.json so a bar
+    widget can read it without recomputing anything; `report` passes `keep`,
+    a row filter, to narrow it to the selection being viewed."""
+    now = now or dt.datetime.now().astimezone()
+    end = end if end is not None else int(now.timestamp())
+    rates = load_rates()
+    out = {'since': None, 'models': []}
+    monthly = next((limit for limit in quota('opencode-go').get('limits', []) if limit.get('label') == 'Monthly' and limit.get('resetsAt')), None)
+    out['since'] = int(timestamp(monthly['resetsAt']) - 30 * 86400) if monthly else int(dt.datetime.combine(now.date().replace(day=1), dt.time()).timestamp())
+    used = {}
+    ledger.db.row_factory = sqlite3.Row
+    for row in ledger.db.execute('SELECT * FROM events WHERE provider=? AND ts>=? AND ts<=?', ('opencode-go', out['since'], end)):
+        r = dict(row)
+        if keep is not None and not keep(r): continue
+        rate = rates['document'].get('opencode-go/' + r['model']) or rates['document'].get(r['model'])
+        if not isinstance(rate, dict) or not isinstance(rate.get('monthly_limit_usd'), (int, float)): continue
+        entry = used.setdefault(r['model'], [rate, 0.0])
+        entry[1] += price(r, rates['document'])[0] or 0
+    for model, (rate, value) in sorted(used.items(), key=lambda item: item[1][1], reverse=True):
+        limit, promo, promo_ends = rate['monthly_limit_usd'], False, ''
+        if isinstance(rate.get('monthly_limit_promo_usd'), (int, float)) and rate.get('promo_ends') and now.date() <= dt.date.fromisoformat(rate['promo_ends']):
+            limit, promo, promo_ends = rate['monthly_limit_promo_usd'], True, rate['promo_ends']
+        out['models'].append({'model': model, 'value': value, 'limit': limit, 'promo': promo, 'promoEnds': promo_ends})
+    return out
+
+
 def report(ledger, cfg, days=7, provider='all', now=None, selection=None):
     selection = selection or {}
     # Sources left out of this view. They are dropped before anything is
@@ -2188,31 +2218,19 @@ def report(ledger, cfg, days=7, provider='all', now=None, selection=None):
         if counts:
             card['quota'] = card['quota'] | {'limits': [limit | {'tokens': counts[index][1]} if index in counts else limit
                                                         for index, limit in enumerate(card['quota']['limits'])]}
-    # Model-level allowance for Go. The quota endpoint reports only aggregate
-    # windows, so value against each model's documented monthly limit is
-    # estimated from local history during the current monthly reset window.
+    # Model-level allowance for Go, estimated by go_model_allowance. `scan`
+    # persists the unfiltered view for bar widgets; here the rows follow the
+    # report's selection, so the card cannot list models the rest of the page
+    # is excluding.
     go_allowance = {'since': None, 'models': []}
     if 'opencode-go' in providers and provider in ('all', 'opencode-go') and 'opencode-go' not in excluded_sources:
-        monthly = next((limit for limit in quota('opencode-go').get('limits', []) if limit.get('label') == 'Monthly' and limit.get('resetsAt')), None)
-        go_allowance['since'] = int(timestamp(monthly['resetsAt']) - 30 * 86400) if monthly else int(dt.datetime.combine(today.date().replace(day=1), dt.time()).timestamp())
-        used = {}
-        for row in ledger.db.execute('SELECT * FROM events WHERE provider=? AND ts>=? AND ts<=?', ('opencode-go', go_allowance['since'], end)):
-            r = dict(row)
-            # The allowance rows follow the model filter too, so the card cannot
-            # list models the rest of the page is excluding.
-            if selection.get('account') and assignments.get(r['id'], 'unassigned') != selection['account']: continue
-            if not selected(r, selection, 'opencode-go'): continue
-            if selection.get('day') and str(dt.datetime.fromtimestamp(r['ts']).date()) != selection['day']: continue
-            if selected_hour is not None and (not timed_event(r) or not selected_hour <= r['ts'] < selected_hour + 3600): continue
-            rate = rates['document'].get('opencode-go/' + r['model']) or rates['document'].get(r['model'])
-            if not isinstance(rate, dict) or not isinstance(rate.get('monthly_limit_usd'), (int, float)): continue
-            entry = used.setdefault(r['model'], [rate, 0.0])
-            entry[1] += price(r, rates['document'])[0] or 0
-        for model, (rate, value) in sorted(used.items(), key=lambda item: item[1][1], reverse=True):
-            limit, promo, promo_ends = rate['monthly_limit_usd'], False, ''
-            if isinstance(rate.get('monthly_limit_promo_usd'), (int, float)) and rate.get('promo_ends') and today.date() <= dt.date.fromisoformat(rate['promo_ends']):
-                limit, promo, promo_ends = rate['monthly_limit_promo_usd'], True, rate['promo_ends']
-            go_allowance['models'].append({'model': model, 'value': value, 'limit': limit, 'promo': promo, 'promoEnds': promo_ends})
+        def keep_go(r):
+            if selection.get('account') and assignments.get(r['id'], 'unassigned') != selection['account']: return False
+            if not selected(r, selection, 'opencode-go'): return False
+            if selection.get('day') and str(dt.datetime.fromtimestamp(r['ts']).date()) != selection['day']: return False
+            if selected_hour is not None and (not timed_event(r) or not selected_hour <= r['ts'] < selected_hour + 3600): return False
+            return True
+        go_allowance = go_model_allowance(ledger, now=today, end=end, keep=keep_go)
     # Per-card model rows from the local ledger. Providers whose quota endpoint
     # reports one aggregate number (Ollama Cloud, for example) draw a single
     # bar, so the local token totals are the only per-model view available.
@@ -2378,6 +2396,7 @@ def main():
             go_quota(args.force)
             if args.action == 'go': ledger.scan(cfg)
             write_agent_record(ledger, 'opencode-go')
+            atomic_json(STATE / 'go-allowance.json', {'generatedAt': time.time()} | go_model_allowance(ledger))
             if args.action == 'scan' and 'grok' in cfg['enabled']:
                 grok_quota(args.force)
                 write_agent_record(ledger, 'grok')
