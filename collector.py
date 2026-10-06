@@ -1922,6 +1922,12 @@ def record_limit_targets(cfg):
 def hourly_snapshot(ledger, now=None, cfg=None):
     """A small, local panel feed. Quota records have a different writer and
     cannot reliably carry hourly history, so the panel reads this file.
+
+    `value` is the estimated API value of the same events `tokens` counts,
+    priced as `report` prices them, and `unpricedTokens` the part of `tokens`
+    no rate covers. `period` is the span every total covers, local midnight
+    to `generatedAt`, as Unix seconds. Bar widgets can show the day's value
+    from this file instead of running a report.
     """
     now = now or dt.datetime.now().astimezone()
     day = now.date()
@@ -1933,15 +1939,20 @@ def hourly_snapshot(ledger, now=None, cfg=None):
              for ts in range(start, end + 1, 3600)]
     providers = {}
     available_providers = [row[0] for row in ledger.db.execute('SELECT DISTINCT provider FROM events')]
-    total = timed = unplaced = 0
+    total = timed = unplaced = unpriced = 0
+    value_total = 0.0
+    rates = load_rates()
     ledger.db.row_factory = sqlite3.Row
-    for row in ledger.db.execute('SELECT provider,client,timePrecision,ts,input,output,cacheRead,cacheWrite '
-                                 'FROM events WHERE ts>=? AND ts<=?', (start, end)):
+    for row in ledger.db.execute('SELECT provider,client,timePrecision,ts,model,apiProvider,reportedValue,reportedCostTicks,'
+                                 'input,output,cacheRead,cacheWrite,cacheWrite1h FROM events WHERE ts>=? AND ts<=?', (start, end)):
         r = dict(row)
         tokens = sum(number(r[f]) for f in FIELDS[:4])
         p = providers.setdefault(r['provider'], {'tokens': 0, 'timedTokens': 0, 'unplacedTokens': 0})
         total += tokens
         p['tokens'] += tokens
+        value = price(r, rates['document'])[0]
+        if value is None: unpriced += tokens
+        else: value_total += value
         if not timed_event(r):
             unplaced += tokens
             p['unplacedTokens'] += tokens
@@ -1955,7 +1966,9 @@ def hourly_snapshot(ledger, now=None, cfg=None):
             by_provider[r['provider']] = by_provider.get(r['provider'], 0) + tokens
     return {'schemaVersion': 1, 'date': str(day), 'generatedAt': now.timestamp(),
             'timeZone': now.tzname() or '', 'utcOffsetMinutes': int(now.utcoffset().total_seconds() // 60),
+            'period': {'start': start, 'end': end},
             'tokens': total, 'timedTokens': timed, 'unplacedTokens': unplaced,
+            'value': value_total, 'unpricedTokens': unpriced,
             'availableProviders': available_providers, 'providers': providers, 'hours': hours,
             # Local tokens in each record's current limit windows, keyed by
             # record id. The panel matches them to its limits by label and
