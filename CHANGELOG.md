@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add the day's estimated API value to `hourly-summary.json`, so a bar widget can show it without running a report. `value` prices the same events `tokens` counts, the way the dashboard's report prices them; `unpricedTokens` is the part no rate covers, and `period` gives the span the totals cover (local midnight to the snapshot, in Unix seconds). The file keeps schema version 1, and readers that ignore the new fields see no change.
+
 ## 1.8.2 - 2026-09-29
 
 - Replace the fast API-key fingerprints in Ollama Cloud, CommandCode, and ClinePass quota caches with salted PBKDF2 fingerprints. Existing caches refresh once after upgrading; key changes still refresh immediately.
